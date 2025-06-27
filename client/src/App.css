@@ -1,0 +1,15 @@
+.app-container {
+  max-width: 800px;
+  margin: auto;
+  font-family: Arial, sans-serif;
+  padding: 20px;
+}
+
+.section {
+  margin-bottom: 30px;
+}
+
+video {
+  width: 100%;
+  border-radius: 8px;
+}

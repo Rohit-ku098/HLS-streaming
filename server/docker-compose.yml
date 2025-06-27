@@ -1,0 +1,13 @@
+version: '3.8'
+
+services:
+  hls-server:
+    build: .
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./output:/app/output
+      - ./uploads:/app/uploads
+    environment:
+      - NODE_ENV=development
+    restart: unless-stopped
