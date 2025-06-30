@@ -5,7 +5,7 @@ export default function VideoList({ onSelectVideo }) {
 
   const fetchVideos = async () => {
     try {
-      const res = await fetch("http://localhost:3000/videos");
+      const res = await fetch("http://localhost:8000/videos/all");
       const data = await res.json();
       console.log("Fetched videos:", data);
       setVideos(data.videos || []);

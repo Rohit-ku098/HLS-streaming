@@ -4,10 +4,10 @@ services:
   hls-server:
     build: .
     ports:
-      - "3000:3000"
+      - "8000:8000"
     volumes:
       - ./output:/app/output
       - ./uploads:/app/uploads
-    environment:
-      - NODE_ENV=development
+    env_file:
+      - .env
     restart: unless-stopped

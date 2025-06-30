@@ -26,7 +26,7 @@ COPY . .
 RUN mkdir -p uploads output
 
 # Expose port
-EXPOSE 3000
+EXPOSE 8000
 
 # Start the server
 CMD ["npm", "start"]

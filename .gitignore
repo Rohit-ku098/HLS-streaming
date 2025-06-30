@@ -1,0 +1,5 @@
+/server/output/
+node_modules
+/server/uploads/
+server/.env
+.env

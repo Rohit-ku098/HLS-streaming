@@ -1,15 +1,38 @@
+// server.js - Fixed CORS and content serving
 const express = require("express");
 const multer = require("multer");
 const cors = require("cors");
-const { exec } = require("child_process");
 const path = require("path");
 const fs = require("fs");
+const dotenv = require("dotenv").config();
+const fetch = (...args) =>
+  import("node-fetch").then((mod) => mod.default(...args));
+// You may need to install this: npm install node-fetch
+
+const { generateSignedUrl } = require("./r2ServiceWrapper");
+const { createHLSStreams } = require("./FFMPEGService");
+
+const BUCKET_NAME = process.env.BUCKET_NAME;
 
 const app = express();
-const PORT = 3000;
+const PORT = 8000;
+
+// Enhanced CORS configuration
+app.use(
+  cors({
+    origin: [
+      "http://localhost:3000",
+      "http://localhost:5173",
+      "http://localhost:5174",
+    ], // Add your React dev server ports
+    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization", "Range"],
+    exposedHeaders: ["Content-Range", "Accept-Ranges", "Content-Length"],
+    credentials: true,
+  })
+);
 
 // Middleware
-app.use(cors());
 app.use(express.json());
 app.use("/output", express.static("output"));
 
@@ -39,87 +62,7 @@ const upload = multer({
       cb(new Error("Only video files are allowed!"));
     }
   },
-  limits: { fileSize: 500 * 1024 * 1024 }, // 500MB limit
 });
-
-// Function to create HLS streams with different resolutions
-function createHLSStreams(inputPath, outputDir, videoId) {
-  return new Promise((resolve, reject) => {
-    const resolutions = [
-      { name: "480p", width: 854, height: 480, bitrate: "1000k" },
-      { name: "720p", width: 1280, height: 720, bitrate: "2500k" },
-      { name: "1080p", width: 1920, height: 1080, bitrate: "5000k" },
-    ];
-
-    const commands = [];
-    const playlistEntries = [];
-
-    // Create FFmpeg commands for each resolution
-    resolutions.forEach((res) => {
-      const outputPath = path.join(outputDir, `${res.name}`);
-      fs.mkdirSync(outputPath, { recursive: true });
-
-      const cmd = `ffmpeg -i "${inputPath}" \
-        -vf "scale=${res.width}:${res.height}" \
-        -c:v libx264 -b:v ${res.bitrate} -c:a aac -b:a 128k \
-        -hls_time 10 -hls_list_size 0 -hls_segment_filename "${outputPath}/segment_%03d.ts" \
-        "${outputPath}/playlist.m3u8"`;
-
-      commands.push(cmd);
-
-      // Add entry for master playlist
-      playlistEntries.push({
-        resolution: res,
-        playlist: `${res.name}/playlist.m3u8`,
-      });
-    });
-
-    // Execute all FFmpeg commands sequentially
-    let currentIndex = 0;
-
-    function executeNext() {
-      if (currentIndex >= commands.length) {
-        // All conversions complete, create master playlist
-        createMasterPlaylist(outputDir, playlistEntries, videoId);
-        resolve(videoId);
-        return;
-      }
-
-      console.log(`Converting to ${resolutions[currentIndex].name}...`);
-      exec(commands[currentIndex], (error, stdout, stderr) => {
-        if (error) {
-          console.error(
-            `Error converting ${resolutions[currentIndex].name}:`,
-            error
-          );
-          reject(error);
-          return;
-        }
-
-        console.log(`${resolutions[currentIndex].name} conversion completed`);
-        currentIndex++;
-        executeNext();
-      });
-    }
-
-    executeNext();
-  });
-}
-
-// Function to create master playlist
-function createMasterPlaylist(outputDir, playlistEntries, videoId) {
-  let masterContent = "#EXTM3U\n#EXT-X-VERSION:3\n\n";
-
-  playlistEntries.forEach((entry) => {
-    const bandwidth = entry.resolution.bitrate.replace("k", "000");
-    masterContent += `#EXT-X-STREAM-INF:BANDWIDTH=${bandwidth},RESOLUTION=${entry.resolution.width}x${entry.resolution.height}\n`;
-    masterContent += `${entry.playlist}\n\n`;
-  });
-
-  const masterPath = path.join(outputDir, "master.m3u8");
-  fs.writeFileSync(masterPath, masterContent);
-  console.log(`Master playlist created: ${masterPath}`);
-}
 
 // Upload endpoint
 app.post("/upload", upload.single("video"), async (req, res) => {
@@ -149,7 +92,7 @@ app.post("/upload", upload.single("video"), async (req, res) => {
     res.json({
       success: true,
       videoId: result,
-      masterPlaylist: `/output/${result}/master.m3u8`,
+      masterPlaylist: `/${result}/master.m3u8`,
       message: "Video processed successfully",
     });
   } catch (error) {
@@ -160,25 +103,161 @@ app.post("/upload", upload.single("video"), async (req, res) => {
   }
 });
 
-// Get video info endpoint
-app.get("/video/:videoId", (req, res) => {
-  const videoId = req.params.videoId;
-  const outputDir = path.join("output", videoId);
-  const masterPlaylist = path.join(outputDir, "master.m3u8");
+// Helper function to fetch content from signed URL
+async function fetchContentFromR2(objectKey, range = null) {
+  try {
+    const signedUrl = await generateSignedUrl(BUCKET_NAME, objectKey, 3600);
 
-  if (fs.existsSync(masterPlaylist)) {
-    res.json({
-      videoId: videoId,
-      masterPlaylist: `/output/${videoId}/master.m3u8`,
-      available: true,
+    const headers = {};
+    if (range) {
+      headers.Range = range;
+    }
+
+    const response = await fetch(signedUrl, { headers });
+
+    if (!response.ok) {
+      throw new Error(`Failed to fetch ${objectKey}: ${response.statusText}`);
+    }
+
+    return response;
+  } catch (error) {
+    console.error(`Error fetching ${objectKey}:`, error);
+    throw error;
+  }
+}
+
+async function rewritePlaylistWithSignedUrls(
+  m3u8Content,
+  videoId,
+  resolution,
+  bucketName,
+  generateSignedUrl
+) {
+  const lines = m3u8Content.split("\n");
+  const rewrittenLines = [];
+
+  for (const line of lines) {
+    if (line.trim().endsWith(".ts")) {
+      const segmentFileName = line.trim(); // e.g., segment_000.ts
+      const objectKey = `videos/${videoId}/${resolution}/${segmentFileName}`;
+
+      try {
+        const signedUrl = await generateSignedUrl(bucketName, objectKey);
+        rewrittenLines.push(signedUrl);
+      } catch (error) {
+        console.error(`Failed to sign segment ${segmentFileName}:`, error);
+        throw error;
+      }
+    } else {
+      // Keep non-segment lines (e.g. #EXTINF, #EXTM3U)
+      rewrittenLines.push(line);
+    }
+  }
+
+  return rewrittenLines.join("\n");
+}
+
+
+// Serve master playlist - fetch content and serve directly
+app.get("/videos/:videoId/master.m3u8", async (req, res) => {
+  try {
+    const videoId = req.params.videoId;
+    const objectKey = `videos/${videoId}/master.m3u8`;
+
+    const response = await fetchContentFromR2(objectKey);
+    let content = await response.text();
+
+    // // Replace playlist URLs to point to our server endpoints
+    // content = content.replace(
+    //   /(\d+p)\/playlist\.m3u8/g,
+    //   `/${videoId}/$1/playlist.m3u8`
+    // );
+
+    res.set({
+      "Content-Type": "application/vnd.apple.mpegurl",
+      "Cache-Control": "no-cache",
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Headers": "Range",
     });
-  } else {
-    res.status(404).json({ error: "Video not found" });
+
+    res.send(content);
+  } catch (error) {
+    console.error("Failed to get master playlist:", error);
+    res
+      .status(500)
+      .json({ error: `Failed to get master playlist: ${error.message}` });
+  }
+});
+
+// Serve resolution-specific playlists - fetch content and serve directly
+app.get("/videos/:videoId/:resolution/playlist.m3u8", async (req, res) => {
+  try {
+    const { videoId, resolution } = req.params;
+    const objectKey = `videos/${videoId}/${resolution}/playlist.m3u8`;
+
+    const response = await fetchContentFromR2(objectKey);
+    let content = await response.text();
+
+    const signedContent = await rewritePlaylistWithSignedUrls(content, videoId, resolution, BUCKET_NAME, generateSignedUrl)
+
+
+    // Replace segment URLs to point to our server endpoints
+    // content = content.replace(
+    //   /segment_(\d+)\.ts/g,
+    //   `/${videoId}/${resolution}/segment_$1.ts`
+    // );
+
+    res.set({
+      "Content-Type": "application/vnd.apple.mpegurl",
+      "Cache-Control": "no-cache",
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Headers": "Range",
+    });
+
+    res.send(signedContent);
+  } catch (error) {
+    console.error("Failed to get playlist:", error);
+    res.status(500).json({ error: "Failed to get playlist" });
+  }
+});
+
+// Serve video segments - proxy with range support
+app.get("/videos/:videoId/:resolution/:segment", async (req, res) => {
+  try {
+    const { videoId, resolution, segment } = req.params;
+    const objectKey = `videos/${videoId}/${resolution}/${segment}`;
+    const range = req.headers.range;
+
+    const response = await fetchContentFromR2(objectKey, range);
+
+    // Copy headers from R2 response
+    res.set({
+      "Content-Type": "video/mp2t",
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Headers": "Range",
+      "Accept-Ranges": "bytes",
+      "Cache-Control": "public, max-age=31536000", // Cache segments for 1 year
+    });
+
+    if (response.headers.get("content-range")) {
+      res.set("Content-Range", response.headers.get("content-range"));
+      res.status(206); // Partial Content
+    }
+
+    if (response.headers.get("content-length")) {
+      res.set("Content-Length", response.headers.get("content-length"));
+    }
+
+    // Stream the content
+    response.body.pipe(res);
+  } catch (error) {
+    console.error("Failed to serve segment:", error);
+    res.status(500).json({ error: "Failed to serve segment" });
   }
 });
 
 // List all videos endpoint
-app.get("/videos", (req, res) => {
+app.get("/videos/all", (req, res) => {
   try {
     const outputDir = "output";
     if (!fs.existsSync(outputDir)) {
@@ -190,7 +269,7 @@ app.get("/videos", (req, res) => {
       .filter((item) => fs.statSync(path.join(outputDir, item)).isDirectory())
       .map((videoId) => ({
         videoId,
-        masterPlaylist: `/output/${videoId}/master.m3u8`,
+        masterPlaylist: `/${videoId}/master.m3u8`,
       }));
 
     res.json({ videos });
@@ -205,8 +284,10 @@ app.get("/", (req, res) => {
     message: "HLS Streaming Server is running",
     endpoints: {
       upload: "POST /upload",
-      getVideo: "GET /video/:videoId",
-      listVideos: "GET /videos",
+      masterPlaylist: "GET /:videoId/master.m3u8",
+      playlist: "GET /:videoId/:resolution/playlist.m3u8",
+      segment: "GET /:videoId/:resolution/:segment",
+      listVideos: "GET /videos/all",
     },
   });
 });
@@ -214,7 +295,7 @@ app.get("/", (req, res) => {
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`HLS Streaming Server running on http://localhost:${PORT}`);
   console.log("Upload videos to: POST /upload");
-  console.log("View videos at: GET /video/:videoId");
+  console.log("View videos at: GET /:videoId/master.m3u8");
 });
 
 module.exports = app;
